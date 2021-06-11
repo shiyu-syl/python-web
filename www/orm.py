@@ -92,11 +92,39 @@ class ModelMetaclass(type):
         logging.info('found model: %s (table: %s)' % (name, tableName))
 
         mappings = dict()
-        fileds = []
+        fields = []
         primarykey = None
 
+        for k,v in attrs.items():
+            if isinstance(v, Field):
+                logging.info('found mapping: %s -> %s' % (k,v))
+                mappings[k] = v
+                if v.primary_key:
+                    if primarykey:
+                        raise RuntimeError('Duplicate primary key for filed: %s' %k)
+                    primarykey = k
+                else:
+                    fields.append(k)
+        
+        if not primarykey:
+            raise RuntimeError('primary key not found')
+        
+        for k in mappings.keys():
+            attrs.pop(k)
+        
+        escaped_fields = list(map(lambda f: '`%s`' % f, fields))
+        # map(square,[1,2,3,4,5]) 计算这个list里的平方 结果返回一个iterator
+        attrs['__mappings__'] = mappings
+        attrs['__table__'] = tableName
+        attrs['__primary_key__'] = primarykey
+        attrs['__fields__'] = fields
+        attrs['__select__'] = 'select `%s`, %s from `%s`' % (primarykey, ','.join(escaped_fields), tableName)
+        attrs['__insert__'] = 'insert into `%s` ( %s, `%s`) values (%s)' % (tableName, ','.join(escaped_fields), primarykey, create_args_string(len(escaped_fields)+1))
+        attrs['__update__'] = 'update `%s` set %s where `%s` = ?' % (tableName, ','.join(map(lambda f : '`%s` = ?' % mappings.get(f).name or f, fields)), primarykey)
+        attrs['__delete__'] = 'delete from `%s` where `%s` = ?' % (tableName, primarykey)
 
-class Model(dict,metaclass = ModelMetaclass):
+
+class Model(dict, metaclass = ModelMetaclass):
     def __init__(self, **kw):
         super().__init__(**kw)
     
@@ -120,8 +148,78 @@ class Model(dict,metaclass = ModelMetaclass):
                 value = field.default() if callable(field.default) else field.default
                 logging.debug('using default value for %s: %s' % (key, str(value)))
                 setattr(self, key, value)
-        
         return value
+
+    @classmethod
+    async def findAll(cls, where = None, args = None, **kw):
+        sql = [cls.__select__]
+        if where:
+            sql.append('where')
+            sql.append(where) #这里不会有注入的可能吗？
+        if args is None:
+            args = []
+        
+        orderBy = kw.get('orderBy', None)
+        if orderBy:
+            sql.append('order by')
+            sql.append(orderBy) #为什么不添加在args?
+        
+        limit = kw.get('limit', None)
+        if limit:
+            sql.append('limit')
+            if isinstance(limit,int):
+                sql.append('?')
+                args.append(limit)
+            elif isinstance(limit,tuple) and len(limit) == 2:
+                sql.append('?, ?')
+                args.extend(limit)
+            else:
+                raise ValueError('Invalid limit value: %s' % str(limit))
+            
+        rs = await select(' '.join(sql), args)
+        return [cls(**r) for r in rs]
+    
+    @classmethod
+    async def findNumber(cls, selectField, where=None, args=None):
+        sql = ['select %s _num_ from `%s`' % (selectField, cls.__table)]
+        #这里的selectField是count(*)之类的?
+        if where:
+            sql.append('where')
+            sql.append(where)
+        rs = await select(' '.join(sql), args, 1)
+        if len(rs) == 0:
+            return None
+        return rs[0]['_num_']
+    
+    @classmethod
+    async def find(cls,pk):
+        rs = await select('%s where `%s` = ?' % (cls.__select__, cls.__primary_key__))
+        if len(rs) == 0:
+            return None
+        return cls(**rs[0])
+    
+    async def save(self):
+        args = list(map(self.getValueOrDefault, self.__fields__))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows = await execute(self.__insert__, args)
+        if rows != 1:
+            logging.warning('failed to insert record: affected rows: %s' % rows)
+
+    async def update(self):
+        args = list(map(self.getValueOrDefault, self.__fields__))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows = await execute(self.__update__, args)
+        if rows != 1:
+            logging.warning('failed to update by primary key: affected rows: %s' % rows)
+
+    async def remove(self):
+        args = [self.getValue(self.__primary_key__)]
+        rows = await execute(self.__delete__, args)
+        if rows != 1:
+            logging.warning('failed to remove by primary key: affected rows: %s' % rows)
+        
+
+    
 
 
 
